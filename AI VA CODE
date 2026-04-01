@@ -1,0 +1,272 @@
+import speech_recognition as sr
+import pyttsx3
+from openai import OpenAI
+import json
+import os
+from datetime import datetime
+import webbrowser
+import threading
+from flask import Flask, render_template, request, jsonify
+
+
+# ── Voice Assistant Core ──────────────────────────────────────────────────────
+
+class VoiceAssistant:
+    def _init_(self, api_key=None):
+
+        # Text-to-speech
+        self.engine = None
+        try:
+            self.engine = pyttsx3.init()
+            self.set_voice_properties()
+        except Exception as e:
+            print(f"[TTS] Warning: {e} — text-to-speech disabled.")
+
+        # Speech recognizer
+        self.recognizer = sr.Recognizer()
+        try:
+            self.microphone = sr.Microphone()
+        except OSError as e:
+            print(f"[MIC] Warning: {e} — microphone disabled.")
+            self.microphone = None
+
+        # OpenAI
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+
+        # Conversation memory
+        self.conversation_history = []
+        self.max_history = 10
+
+        self.name = "HAUL"
+
+    # ── TTS ───────────────────────────────────────────────────────────────────
+
+    def set_voice_properties(self):
+        if not self.engine:
+            return
+        voices = self.engine.getProperty('voices')
+        if len(voices) > 1:
+            try:
+                self.engine.setProperty('voice', voices[1].id)
+            except Exception:
+                self.engine.setProperty('voice', voices[0].id)
+        elif voices:
+            self.engine.setProperty('voice', voices[0].id)
+        self.engine.setProperty('rate', 175)
+        self.engine.setProperty('volume', 0.9)
+
+    def speak(self, text):
+        print(f"{self.name}: {text}")
+        if self.engine:
+            self.engine.say(text)
+            self.engine.runAndWait()
+
+    # ── STT ───────────────────────────────────────────────────────────────────
+
+    def listen(self):
+        if not self.microphone:
+            print("[MIC] No microphone available.")
+            return None
+        with self.microphone as source:
+            print("\nListening...")
+            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            try:
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            except sr.WaitTimeoutError:
+                return None
+        try:
+            text = self.recognizer.recognize_google(audio)
+            print(f"You: {text}")
+            return text.lower()
+        except sr.UnknownValueError:
+            self.speak("Sorry, I didn't catch that. Could you repeat?")
+            return None
+        except sr.RequestError:
+            self.speak("Sorry, there's an issue with the speech recognition service.")
+            return None
+
+    # ── Commands ──────────────────────────────────────────────────────────────
+
+    def process_command(self, text):
+        if not text:
+            return False
+
+        text = text.lower()
+
+        if "time" in text:
+            current_time = datetime.now().strftime("%I:%M %p")
+            self.speak(f"The current time is {current_time}")
+            return True
+
+        elif "date" in text:
+            current_date = datetime.now().strftime("%B %d, %Y")
+            self.speak(f"Today's date is {current_date}")
+            return True
+
+        elif "open browser" in text:
+            self.speak("Opening web browser")
+            webbrowser.open("https://www.google.com")
+            return True
+
+        elif "search for" in text:
+            query = text.replace("search for", "").strip()
+            self.speak(f"Searching for {query}")
+            webbrowser.open(f"https://www.google.com/search?q={query}")
+            return True
+
+        elif any(word in text for word in ["exit", "quit", "bye"]):
+            self.speak("Goodbye! Have a great day!")
+            return "exit"
+
+        return False
+
+    # ── OpenAI ────────────────────────────────────────────────────────────────
+
+    def get_ai_response(self, user_input):
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are {self.name}, a helpful AI voice assistant. "
+                        "Keep responses concise and natural for spoken conversation."
+                    )
+                }
+            ]
+
+            # Include recent conversation history
+            for chat in self.conversation_history[-self.max_history:]:
+                messages.append({"role": "user",      "content": chat["user"]})
+                messages.append({"role": "assistant", "content": chat["assistant"]})
+
+            messages.append({"role": "user", "content": user_input})
+
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=150,
+                temperature=0.7
+            )
+
+            ai_response = response.choices[0].message.content
+
+            # Save to history
+            self.conversation_history.append({
+                "user":      user_input,
+                "assistant": ai_response,
+                "timestamp": datetime.now().isoformat()
+            })
+
+            self.save_conversation()
+            return ai_response
+
+        except Exception as e:
+            return f"Sorry, I encountered an error: {str(e)}"
+
+    # ── Console mode ──────────────────────────────────────────────────────────
+
+    def run(self):
+        self.speak(f"Hello! I'm {self.name}. How can I help you today?")
+        while True:
+            user_input = self.listen()
+            if user_input is None:
+                continue
+            result = self.process_command(user_input)
+            if result == "exit":
+                break
+            elif result:
+                continue
+            if user_input:
+                ai_response = self.get_ai_response(user_input)
+                self.speak(ai_response)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def save_conversation(self):
+        try:
+            with open("conversation_history.json", "w") as f:
+                json.dump(self.conversation_history, f, indent=2)
+        except Exception:
+            pass
+
+
+# ── Flask App ─────────────────────────────────────────────────────────────────
+
+app = Flask(_name_)
+
+# assistant_web is initialized inside _main_ after the API key is collected
+assistant_web = None
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/process_voice', methods=['POST'])
+def process_voice():
+    data = request.json
+    user_input = data.get('text', '').strip()
+
+    if not user_input:
+        return jsonify({"response": "I didn't receive any input.", "exit": False})
+
+    # Check for built-in commands first
+    result = assistant_web.process_command(user_input)
+
+    if result == "exit":
+        return jsonify({"response": "Goodbye! Have a great day!", "exit": True})
+
+    if result:
+        # Command was handled (time, date, browser, etc.)
+        # Re-run to get the spoken text as a string response
+        text = user_input.lower()
+        if "time" in text:
+            response_text = f"The current time is {datetime.now().strftime('%I:%M %p')}"
+        elif "date" in text:
+            response_text = f"Today's date is {datetime.now().strftime('%B %d, %Y')}"
+        elif "open browser" in text:
+            response_text = "Opening your web browser now!"
+        elif "search for" in text:
+            query = text.replace("search for", "").strip()
+            response_text = f"Searching Google for: {query}"
+        else:
+            response_text = "Command executed!"
+        return jsonify({"response": response_text, "exit": False})
+
+    # Otherwise — call OpenAI
+    response_text = assistant_web.get_ai_response(user_input)
+    return jsonify({"response": response_text, "exit": False})
+
+
+def run_flask():
+    app.run(debug=False, use_reloader=False, port=5000)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if _name_ == "_main_":
+    print("=" * 45)
+    print("        HAUL — AI Voice Assistant")
+    print("=" * 45)
+
+    api_key = 
+    # Now create the assistant with the confirmed key
+    assistant_web = VoiceAssistant(api_key=api_key)
+
+    choice = input("\nChoose mode:\n  1 — Console (microphone)\n  2 — Web (browser)\n> ").strip()
+
+    if choice == "2":
+        print("\n✅ Starting web server at http://localhost:5000")
+        print("   Open that URL in your browser.\n")
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        try:
+            while True:
+                pass
+        except KeyboardInterrupt:
+            print("\nShutting down HAUL. Goodbye!")
+    else:
+        assistant = VoiceAssistant(api_key=api_key)
+        assistant.run()
